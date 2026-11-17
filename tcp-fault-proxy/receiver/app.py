@@ -7,7 +7,8 @@ Pure-asyncio TCP server in a single process:
 * sends a JSON receipt back and then half-closes its own write side, so the
   sender can finish the reverse direction even while the upload side is done,
 * exposes the last receipts on a tiny stdlib-free HTTP endpoint used by the
-  smoke tests and by the sender's "view receipt" feature.
+  smoke tests, plus `POST /disconnect` which aborts all in-progress TCP
+  connections to demo/test a receiver-side mid-transfer disconnect.
 """
 
 from __future__ import annotations
@@ -27,6 +28,12 @@ READ_CHUNK = 64 * 1024
 MAX_RECEIPTS = int(os.getenv("RECEIVER_MAX_RECEIPTS", "500"))
 
 receipts: Deque[dict] = deque(maxlen=MAX_RECEIPTS)
+# Live TCP connections, so the demo/test control endpoint can abort them and
+# simulate a receiver-side mid-transfer disconnect.  Writers aborted that way
+# are remembered until their handler exits, so no bogus "receipt" is emitted
+# for a deliberately interrupted upload.
+active_writers: set[asyncio.StreamWriter] = set()
+aborted_writers: set[asyncio.StreamWriter] = set()
 counter = 0
 
 
@@ -37,6 +44,7 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     digest = hashlib.sha256()
     size = 0
     chunks = 0
+    active_writers.add(writer)
     try:
         while True:
             data = await reader.read(READ_CHUNK)
@@ -45,6 +53,13 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             digest.update(data)
             size += len(data)
             chunks += 1
+
+        if writer in aborted_writers:
+            # aborted by the /disconnect demo: not a completed upload, so no
+            # receipt for it.
+            return
+        if writer not in active_writers:
+            return
 
         counter += 1
         receipt_id = f"rx-{counter}"
@@ -70,6 +85,8 @@ async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     except (ConnectionError, asyncio.CancelledError, RuntimeError):
         pass
     finally:
+        active_writers.discard(writer)
+        aborted_writers.discard(writer)
         try:
             writer.close()
             await writer.wait_closed()
@@ -100,10 +117,26 @@ async def http_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             if header in (b"\r\n", b"", b"\n"):
                 break
         if line.startswith("GET /health"):
-            body = json.dumps({"status": "ok", "receipts": len(receipts)}).encode()
+            body = json.dumps(
+                {"status": "ok", "receipts": len(receipts),
+                 "active_connections": len(active_writers)}
+            ).encode()
             status = "200 OK"
         elif line.startswith("GET /receipts"):
             body = json.dumps(list(receipts), ensure_ascii=False).encode()
+            status = "200 OK"
+        elif line.startswith("POST /disconnect"):
+            # Demo/test-only: abort every in-progress receiver connection so
+            # the proxy can be observed tearing the relay down mid-transfer.
+            targets = list(active_writers)
+            aborted_writers.update(targets)
+            for w in targets:
+                try:
+                    w.transport.abort()
+                except Exception:
+                    pass
+            active_writers.clear()
+            body = json.dumps({"aborted": len(targets)}).encode()
             status = "200 OK"
         else:
             body = b'{"detail":"not found"}'

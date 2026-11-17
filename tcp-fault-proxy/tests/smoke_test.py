@@ -18,7 +18,18 @@ Scenarios:
   6. force-close interrupts paused direction and blocked write, tasks exit,
      control API and other connections stay usable;
   7. backpressure: while paused the sender cannot drain the whole sample and
-     proxy per-direction user-space backlog stays <= 256 KiB.
+     proxy per-direction user-space backlog stays <= 256 KiB;
+  8. receiver-side mid-transfer disconnect while the receipt (r2c) direction
+     is manually paused: the upload write fault ends the paused direction,
+     closes both sides, retires the connection with an error reason and
+     releases the sender quickly; the control API and new connections stay
+     usable;
+  9. symmetric case: the upload (c2r) direction is paused when the receiver
+     drops, so the pause cannot observe it by reading; the reverse direction
+     reaching EOF before the upload finished is treated as a fault and also
+     ends the wait instead of leaving the connection active forever;
+ 10. liveness probe: a client RST while one direction is paused is detected
+     via a non-reading SO_ERROR check, so the paused direction also ends.
 """
 
 from __future__ import annotations
@@ -28,6 +39,7 @@ import http.client
 import json
 import os
 import socket
+import struct
 import sys
 import time
 
@@ -351,6 +363,145 @@ def main() -> int:
     http_json(PROXY_API, "POST", f"/connections/{cid}/resume", {"direction": "c2r"})
     run = wait_sender(run["run_id"])
     check("backpressure test finishes clean", run["hash_match"] is True)
+    clear_preset()
+
+    # 8. Receiver disconnects mid-transfer while r2c is paused --------------- #
+    # Reproduces the reported defect: the tester manually pauses the receipt
+    # direction, the receiver then drops the connection, so c2r hits a write
+    # error.  Before the fix the connection stayed active and the sender hung.
+    clear_preset()
+    run = start_send(big_size)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    # Let the upload make progress, then pause the receipt direction.  The
+    # receiver only emits a receipt after EOF, so pausing r2c first is fine:
+    # the point is that the pause must be woken by the c2r write fault.
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "r2c"})
+    deadline = time.time() + 10
+    conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+    while time.time() < deadline and not conn["directions"]["r2c"]["paused"]:
+        time.sleep(0.05)
+        conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+    check("receipt direction manually paused", conn["directions"]["r2c"]["paused"] is True)
+    # Drop the receiver side mid-transfer.
+    disc = http_json(RECEIVER_API, "POST", "/disconnect", {})
+    check("receiver aborted its connection", disc.get("aborted", 0) >= 1,
+          f"aborted={disc.get('aborted')}")
+    t0 = time.time()
+    retired = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        conns = http_json(PROXY_API, "GET", "/connections")
+        if any(c["id"] == cid for c in conns["connections"] if not c["closed"]):
+            time.sleep(0.05)
+            continue
+        retired = next(
+            (c for c in conns["connections"] if c["id"] == cid and c["closed"]),
+            None,
+        )
+        break
+    dt = time.time() - t0
+    check("connection retired quickly after receiver disconnect", retired is not None,
+          f"{dt:.3f}s")
+    check("retired record carries an error reason and timestamp",
+          bool(retired) and bool(retired.get("error")) and retired.get("closed_at") is not None,
+          (retired or {}).get("error") or "no error")
+    check("no direction left paused in the closed record",
+          bool(retired)
+          and not retired["directions"]["r2c"]["paused"]
+          and retired["directions"]["r2c"]["paused_since"] is None,
+          f"r2c paused={retired['directions']['r2c']['paused'] if retired else '?'}")
+    run = wait_sender(run["run_id"], timeout=20)
+    check("sender released after receiver disconnect", run["phase"] == "failed",
+          run.get("error") or "")
+    # Control API and new connections must still work.
+    http_json(PROXY_API, "GET", "/health")
+    clear_preset()
+    run2 = start_send(size)
+    run2 = wait_sender(run2["run_id"])
+    check("new connection unaffected by receiver disconnect",
+          run2["phase"] == "done" and run2["hash_match"] is True)
+    clear_preset()
+
+    # 9. Receiver disconnects while the upload direction is paused ---------- #
+    # A paused direction deliberately stops reading, so it cannot notice the
+    # target's RST itself.  The reverse direction does see EOF; because that
+    # happens before the upload finished, the proxy must treat it as a fault
+    # and tear the connection down instead of waiting forever.
+    clear_preset()
+    run = start_send(big_size)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "c2r"})
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        conn = http_json(PROXY_API, "GET", f"/connections/{cid}")
+        if conn["directions"]["c2r"]["paused"]:
+            break
+        time.sleep(0.05)
+    check("upload direction manually paused", conn["directions"]["c2r"]["paused"] is True)
+    disc = http_json(RECEIVER_API, "POST", "/disconnect", {})
+    check("receiver aborted its connection (paused upload)", disc.get("aborted", 0) >= 1)
+    t0 = time.time()
+    retired = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        conns = http_json(PROXY_API, "GET", "/connections")
+        if any(c["id"] == cid for c in conns["connections"] if not c["closed"]):
+            time.sleep(0.05)
+            continue
+        retired = next(
+            (c for c in conns["connections"] if c["id"] == cid and c["closed"]), None
+        )
+        break
+    dt = time.time() - t0
+    check("paused-upload connection retired after receiver disconnect",
+          retired is not None, f"{dt:.3f}s")
+    check("paused-upload teardown records a reason",
+          bool(retired) and bool(retired.get("error")),
+          (retired or {}).get("error") or "no error")
+    run = wait_sender(run["run_id"], timeout=20)
+    check("sender released (paused upload + receiver disconnect)",
+          run["phase"] == "failed", run.get("error") or "")
+    http_json(PROXY_API, "GET", "/health")
+    run2 = start_send(size)
+    run2 = wait_sender(run2["run_id"])
+    check("new connection unaffected by paused-upload teardown",
+          run2["phase"] == "done" and run2["hash_match"] is True)
+    clear_preset()
+
+    # 10. Client RST while a direction is paused ---------------------------- #
+    # The paused direction performs no read/write, so the proxy probes
+    # SO_ERROR (without reading data) to notice the peer reset.
+    clear_preset()
+    sock = socket.create_connection(PROXY_TCP.split(":"))
+    sock.settimeout(5)
+    sock.sendall(b"r" * 65536)
+    conn = wait_conn_active()
+    cid = conn["id"]
+    http_json(PROXY_API, "POST", f"/connections/{cid}/pause", {"direction": "c2r"})
+    time.sleep(0.2)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
+    t0 = time.time()
+    retired = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        conns = http_json(PROXY_API, "GET", "/connections")
+        if any(c["id"] == cid for c in conns["connections"] if not c["closed"]):
+            time.sleep(0.1)
+            continue
+        retired = next(
+            (c for c in conns["connections"] if c["id"] == cid and c["closed"]), None
+        )
+        break
+    dt = time.time() - t0
+    check("client RST while paused is detected without reading",
+          retired is not None, f"{dt:.3f}s")
+    check("client RST teardown records an error",
+          bool(retired) and bool(retired.get("error")),
+          (retired or {}).get("error") or "no error")
+    http_json(PROXY_API, "GET", "/health")
     clear_preset()
 
     # Summary -------------------------------------------------------------- #

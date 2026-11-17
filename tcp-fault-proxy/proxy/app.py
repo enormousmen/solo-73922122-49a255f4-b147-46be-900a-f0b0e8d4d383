@@ -26,6 +26,15 @@ Guarantees implemented in this file:
   been forwarded after resume; the reverse direction keeps flowing.
 * A force-close aborts both transports, cancels both pump tasks and waits
   until they have exited before reporting completion.
+* Failure teardown: as soon as either direction exits because of a read /
+  write error, the other direction is woken from a pause or interrupted in
+  a blocked read/write, both transports are aborted, the connection is
+  retired to the closed list with an ``error`` reason, and a normal upload
+  half-close (c2r FIN) still keeps reading the receipt direction until EOF.
+  If the receipt direction reaches EOF while the upload is still unfinished
+  (target closed early), that is treated as a fault too, so a paused upload
+  cannot keep the connection active forever.  One broken connection never
+  blocks the control API or other connections.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import socket
 import time
 import uuid
 from collections import deque
@@ -178,6 +188,11 @@ class Conn:
         st.resume_event.set()
         return True
 
+    def wake_all(self) -> None:
+        """Wake every paused direction (used for failure teardown/shutdown)."""
+        for d in DIRECTIONS:
+            self.dir[d].resume_event.set()
+
     def snapshot(self) -> dict:
         return {
             "id": self.id,
@@ -206,7 +221,10 @@ class Registry:
 
     def retire(self, conn: Conn) -> None:
         self.active.pop(conn.id, None)
-        self.closed.appendleft(conn.snapshot())
+        record = conn.snapshot()
+        if conn.error and not record.get("error"):
+            record["error"] = conn.error
+        self.closed.appendleft(record)
 
     def list(self) -> list[dict]:
         # Newest first: active connections, then closed records.
@@ -221,17 +239,76 @@ registry = Registry()
 # --------------------------------------------------------------------------- #
 
 
+class PumpFailure(Exception):
+    """A direction failed (read/write error) and must tear the whole
+    connection down.
+
+    ``cancelled`` distinguishes a deliberate force-close / shutdown (expected,
+    no error reason recorded) from a genuine transport fault (recorded in the
+    closed record and propagated to the other direction).
+    """
+
+    def __init__(self, message: str, cancelled: bool = False):
+        super().__init__(message)
+        self.message = message
+        self.cancelled = cancelled
+
+
+def _describe(exc: BaseException) -> str:
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
+
+
 async def _wait_resume(st: DirState, conn: Conn) -> None:
-    """Block while the direction is paused or while the connection dies."""
+    """Block while the direction is paused or while the connection dies.
+
+    While paused the direction does no I/O by design, so it cannot notice a
+    peer reset through read/write.  Probe the sockets' pending SO_ERROR
+    periodically instead: that is a liveness check only (no data is read, no
+    buffering, backpressure untouched) and lets a paused direction end when
+    the other endpoint aborted the connection.
+    """
     while st.paused and not conn.closed:
         try:
             await asyncio.wait_for(st.resume_event.wait(), timeout=0.5)
         except asyncio.TimeoutError:
-            continue
+            pass
+        if conn.closed:
+            return
+        for writer in (conn.client_writer, conn.remote_writer):
+            err = _socket_error(writer)
+            if err:
+                raise PumpFailure(
+                    f"{st.direction} paused, peer socket failed: "
+                    f"{_describe(OSError(err, os.strerror(err)))}"
+                )
+
+
+def _socket_error(writer: asyncio.StreamWriter) -> Optional[int]:
+    """Pending SO_ERROR on a socket, without reading any buffered data.
+
+    A paused direction deliberately does not read its socket, so it would
+    otherwise never notice that the peer aborted the connection.  Reading
+    SO_ERROR is a pure liveness probe: it neither buffers payload nor
+    disturbs the backlog/backpressure behaviour.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return None
+    try:
+        return sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) or None
+    except OSError:
+        return None
 
 
 async def pump(conn: Conn, direction: Direction) -> None:
-    """Forward exactly one direction, honouring the pause/backlog rules."""
+    """Forward exactly one direction, honouring the pause/backlog rules.
+
+    Returns normally on a clean half-close/EOF path.  Raises ``PumpFailure``
+    when the direction aborted because of a read/write error or a deliberate
+    force-close, so the supervisor can wake and stop the reverse direction.
+    """
     if direction == "c2r":
         reader, writer = conn.client_reader, conn.remote_writer
     else:
@@ -247,7 +324,12 @@ async def pump(conn: Conn, direction: Direction) -> None:
             if st.paused:
                 await _wait_resume(st, conn)
                 if conn.closed:
-                    return
+                    # Force-close/shutdown or the other direction already
+                    # failed and retired this connection: nothing to record.
+                    raise PumpFailure(
+                        conn.error or f"{direction} stopped: connection closed",
+                        cancelled=True,
+                    )
 
             # Flush the backlog that was held when the threshold tripped,
             # before reading anything new from the socket.
@@ -277,7 +359,10 @@ async def pump(conn: Conn, direction: Direction) -> None:
                     # FIN must not cross the pause; wait, then flush backlog.
                     await _wait_resume(st, conn)
                     if conn.closed:
-                        return
+                        raise PumpFailure(
+                            conn.error or f"{direction} stopped: connection closed",
+                            cancelled=True,
+                        )
                     if st.pending:
                         tail = st.pending
                         st.pending = b""
@@ -312,13 +397,20 @@ async def pump(conn: Conn, direction: Direction) -> None:
             writer.write(data)
             await writer.drain()
             st.forwarded += len(data)
-    except (asyncio.CancelledError, ConnectionError, RuntimeError):
-        # Force-close (transport abort / task cancel) or peer reset: the
-        # supervisor performs the cleanup.
+    except PumpFailure:
         raise
-    except Exception as exc:  # pragma: no cover - defensive
-        conn.error = f"{direction} pump error: {exc!r}"
-        raise
+    except asyncio.CancelledError as exc:
+        # Deliberate force-close / shutdown cancels the pumps.
+        raise PumpFailure(f"{direction} cancelled", cancelled=True) from exc
+    except Exception as exc:
+        if conn.closed:
+            # The connection was already being torn down on purpose; the
+            # reset seen here is a consequence, not a new fault.
+            raise PumpFailure(f"{direction} stopped: connection closed",
+                              cancelled=True) from exc
+        # A read or write fault in this direction: record the cause and let
+        # the supervisor wake/interrupt the reverse direction and tear down.
+        raise PumpFailure(f"{direction} pump error: {_describe(exc)}") from exc
 
 
 def _deliver_fin(writer: asyncio.StreamWriter, st: DirState) -> None:
@@ -353,7 +445,9 @@ async def handle_client(
             {
                 "id": conn_id,
                 "peer": f"{peer[0]}:{peer[1]}",
+                "created_at": _now(),
                 "closed": True,
+                "closed_at": _now(),
                 "error": f"connect target {TARGET_HOST}:{TARGET_PORT} failed: {exc!r}",
                 "directions": {},
             }
@@ -363,17 +457,81 @@ async def handle_client(
     conn = Conn(conn_id, client_reader, client_writer, remote_reader, remote_writer, peer)
     registry.add(conn)
 
-    conn.tasks["c2r"] = asyncio.create_task(pump(conn, "c2r"), name=f"{conn_id}-c2r")
-    conn.tasks["r2c"] = asyncio.create_task(pump(conn, "r2c"), name=f"{conn_id}-r2c")
-    tasks = [t for t in conn.tasks.values() if t is not None]
+    c2r_task = asyncio.create_task(pump(conn, "c2r"), name=f"{conn_id}-c2r")
+    r2c_task = asyncio.create_task(pump(conn, "r2c"), name=f"{conn_id}-r2c")
+    conn.tasks["c2r"] = c2r_task
+    conn.tasks["r2c"] = r2c_task
 
+    failure: Optional[PumpFailure] = None
+    tasks = [c2r_task, r2c_task]
     try:
-        # The connection lives until both pump tasks have exited (normal
-        # half-close completion, error, or force-close cancellation).
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Wait for the first *outcome*: a clean exit (normal half-close) keeps
+        # the connection alive for the reverse direction (e.g. c2r FIN while
+        # the receipt is still being read).  A fault in either direction ends
+        # the whole connection: wake the other direction out of a pause,
+        # abort both transports and cancel whatever is still running.
+        pending: set[asyncio.Task] = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in done:
+                if t.cancelled():
+                    continue  # deliberate force-close / shutdown
+                exc = t.exception()
+                if isinstance(exc, PumpFailure):
+                    if failure is None or (failure.cancelled and not exc.cancelled):
+                        failure = exc
+                    if not exc.cancelled:
+                        pending.clear()  # stop waiting, tear down now
+                    break
+                if exc is not None:  # pragma: no cover - defensive
+                    failure = PumpFailure(
+                        f"{t.get_name()} crashed: {_describe(exc)}"
+                    )
+                    pending.clear()
+                    break
+                # Clean exit = normal half-close.  A clean r2c EOF is only
+                # legitimate once the upload (c2r) is finished; if the target
+                # closes its write side while the upload is still in flight
+                # (e.g. receiver disconnected), the upload cannot complete —
+                # stop it instead of leaving it paused forever.
+                if (
+                    t is r2c_task
+                    and not c2r_task.done()
+                    and not conn.dir["c2r"].eof_seen
+                ):
+                    failure = PumpFailure(
+                        "r2c peer closed (target EOF) before upload finished"
+                    )
+                    pending.clear()
+                    break
+            if failure is not None and not failure.cancelled:
+                break
+
+        if failure is not None and not failure.cancelled:
+            conn.error = failure.message
+            conn.closed = True
+            conn.wake_all()
+            for writer in (client_writer, remote_writer):
+                _abort_transport(writer)
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            # Clean completion of both directions (or a deliberate close).
+            conn.closed = True
     finally:
         conn.closed = True
-        conn.closed_at = _now()
+        if conn.closed_at is None:
+            conn.closed_at = _now()
+        # Nothing is waiting any more: a retired record must not claim a
+        # direction is still paused (including force-close/error teardown).
+        conn.wake_all()
+        for d in DIRECTIONS:
+            conn.dir[d].paused = False
+            conn.dir[d].paused_since = None
         for writer in (client_writer, remote_writer):
             try:
                 writer.close()
@@ -384,9 +542,18 @@ async def handle_client(
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for writer in (client_writer, remote_writer):
-            with suppress(OSError, RuntimeError):
-                await writer.wait_closed()
+            with suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
         registry.retire(conn)
+
+
+def _abort_transport(writer: asyncio.StreamWriter) -> None:
+    """Abort a transport immediately, waking blocked reads and drain()."""
+    try:
+        writer.transport.abort()
+    except Exception:
+        with suppress(Exception):
+            writer.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -407,8 +574,7 @@ async def lifespan(app: FastAPI):
         # without leaving half-closed sockets behind.
         for conn in list(registry.active.values()):
             conn.closed = True
-            for d in DIRECTIONS:
-                conn.dir[d].resume_event.set()
+            conn.wake_all()
             for writer in (conn.client_writer, conn.remote_writer):
                 with suppress(Exception):
                     writer.transport.abort()
@@ -522,14 +688,9 @@ async def force_close(conn_id: str) -> OpResponse:
     """
     conn = registry.get_active(conn_id)
     conn.closed = True  # wake any _wait_resume loop
-    for d in DIRECTIONS:
-        conn.dir[d].resume_event.set()
+    conn.wake_all()
     for writer in (conn.client_writer, conn.remote_writer):
-        try:
-            writer.transport.abort()
-        except Exception:
-            with suppress(Exception):
-                writer.close()
+        _abort_transport(writer)
     tasks = [t for t in conn.tasks.values() if t is not None]
     for t in tasks:
         if not t.done():

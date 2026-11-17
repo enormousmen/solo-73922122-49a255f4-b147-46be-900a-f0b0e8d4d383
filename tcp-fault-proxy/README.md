@@ -17,7 +17,7 @@
 
 | 组件 | 端口 | 说明 |
 | --- | --- | --- |
-| receiver | TCP 9100 / HTTP 9101 | 收满到 EOF 才计算并返回 `{bytes, sha256, ...}` 回执；HTTP 查最近回执 |
+| receiver | TCP 9100 / HTTP 9101 | 收满到 EOF 才计算并返回 `{bytes, sha256, ...}` 回执；HTTP 查最近回执；`POST /disconnect` 演示中途断连 |
 | proxy | TCP 9000 / HTTP 8080 | 故障转发入口；8080 为控制 API 与 `/docs` |
 | sender | HTTP 8081 | `/docs` 发起上传、查看 run 与回执 |
 
@@ -37,7 +37,7 @@ curl http://127.0.0.1:9101/receipts
 ```bash
 scripts/run-local.sh        # 建 venv、装依赖、起三个进程（日志在 /tmp/fp-logs）
 scripts/stop-local.sh       # 停止
-python -I tests/smoke_test.py   # 端到端冒烟（37 项检查）
+python -I tests/smoke_test.py   # 端到端冒烟（52 项检查）
 ```
 
 ## 复现卡顿并定位超时阶段（标准操作流）
@@ -51,6 +51,10 @@ python -I tests/smoke_test.py   # 端到端冒烟（37 项检查）
 5. 要定位**回执阶段**超时：`PUT /preset` 设 `r2c_pause_after=16`，此时上传正常完成
    （`c2r.half_closed_delivered=true`），run 停在 `waiting-receipt`，恢复 `r2c` 后才收到回执。
 6. `POST /connections/{id}/force-close` 可随时强断，立即打断暂停与阻塞写。
+7. 演示**接收端中途断连**：在回执方向暂停（或上传进行中）时 `curl -X POST
+   http://127.0.0.1:9101/disconnect`。代理会立即结束另一方向的暂停/阻塞，关闭两端，
+   连接从活动列表移入已关闭记录并带 `error`（如 `c2r pump error: ConnectionResetError`），
+   发送器 run 变 `failed`；控制 API 与后续新连接不受影响。
 
 ## 控制 API（proxy:8080）
 
@@ -83,17 +87,33 @@ python -I tests/smoke_test.py   # 端到端冒烟（37 项检查）
 - **强断语义**：`transport.abort()` 让阻塞的 `drain()`/`read()` 立即抛错，两个 pump
   被取消并退出，supervisor 关闭两端 socket、连接从活动列表移除后 API 才报完成；
   其他连接与控制 API 不受影响（冒烟测试覆盖）。
+- **双向故障收尾**：任一方向因读/写故障退出时，supervisor 立即唤醒另一方向的暂停
+  等待、`abort` 两端 socket 打断另一方向可能阻塞的读/写并取消其任务，等两个 pump
+  都退出后关闭两端，把连接移入已关闭记录并写入 `error`（含故障方向与异常类型）。
+  正常上传半关闭（c2r FIN）**不触发**收尾，回执方向继续读到 EOF；手动强断同样等待
+  两个任务退出后才返回。收尾不占用其他连接，控制 API 始终可用。
+  暂停方向按设计不读 socket（以保证背压与不额外缓冲），因此等待恢复期间会周期性
+  用 `SO_ERROR` 做只读存活探测（不读数据、不改变背压）：对端 RST 时暂停方向也能
+  发现并触发收尾。另有一条兜底规则：若回执方向（r2c）先到 EOF 而上传方向尚未完成，
+  视为目标提前关闭的故障并结束等待，避免“上传方向暂停 + 接收端断连”永久滞留。
+  若接收端已**正常**完成并关闭（无 RST）、而回执方向被手动暂停，则回执字节保留在
+  代理侧，`resume` 后完整送达（这是暂停语义，不是故障）。
 
 ## 测试
 
 `tests/smoke_test.py`（纯标准库）覆盖：基线哈希一致、自动暂停精确停 N、积压/FIN 暂扣、
 奇数 N 跨块、手动暂停/恢复、回执方向暂停、强断与隔离性、背压下用户态积压 ≤ 256 KiB、
-32 MiB 级载荷恢复后哈希一致。可用环境变量 `PROXY_API/SENDER_API/RECEIVER_API/PROXY_TCP`
-指向 Compose 暴露的端口直接对容器跑。
+32 MiB 级载荷恢复后哈希一致，以及**接收端中途断连**的两种对称情形：
+（a）回执方向暂停时上传写入报错 → 另一方向暂停被解除、两端关闭、连接带 error 退休、
+发送器快速失败、控制 API 与新连接可用；（b）上传方向暂停时接收端断连 → 回执方向先到
+EOF、代理判定上传未完成的提前关闭为故障并同样完成收尾；另有客户端在暂停期间 RST，
+由只读 `SO_ERROR` 存活探测触发同样的收尾。
+可用环境变量 `PROXY_API/SENDER_API/RECEIVER_API/PROXY_TCP` 指向 Compose 暴露的端口直接
+对容器跑。
 
 ```bash
 python -I tests/smoke_test.py
-# 37/37 checks passed
+# 52/52 checks passed
 ```
 
 ## 实测结果（本环境，Python 3.11.2 / loopback）
@@ -101,7 +121,8 @@ python -I tests/smoke_test.py
 环境无 Docker 守护进程，故用等价的三进程本地部署验证（Compose 文件已就绪，逻辑与
 容器部署一致，仅主机名改为 127.0.0.1）。连续多轮结果：
 
-- 冒烟套件 **37/37 通过**，并连跑 8 轮无回归；覆盖下列断言。
+- 冒烟套件 **52/52 通过**（新增接收端断连两种对称场景与暂停期间 RST 探测共 15 项），
+  并连跑多轮无回归。
 - 精确停点：阈值 N=300000、100007（奇数，跨 64KiB 读块）、1048576、4194304、0
   均实测 `forwarded_bytes == N`，暂停期间计数冻结、FIN 不送达。
 - 背压：16 MiB 载荷在 N=300000 暂停后，发送器实际卡在 `drain()`（仅发出约 3.75 MiB），
@@ -112,6 +133,12 @@ python -I tests/smoke_test.py
   恢复 r2c 后才收到回执——可据此区分超时在上传还是回执阶段。
 - 强断：暂停中的连接 `force-close` 约 20–40 ms 返回，发送端收到
   `ConnectionResetError`，连接从活动列表移除，控制 API 与后续新连接不受影响。
+- 接收端断连：回执方向暂停时 `POST /disconnect`，上传方向写入立即
+  `ConnectionResetError`，代理约 50 ms 内解除另一方向暂停、关闭两端并以
+  `error="c2r pump error: ConnectionResetError: ..."` 退休连接；发送器 run 变
+  `failed`，新连接照常完成上传且哈希一致。上传方向暂停时断连同样在数毫秒内以
+  `error="r2c peer closed (target EOF) before upload finished"` 收尾；客户端在暂停
+  期间发 RST 也在数毫秒内经只读 `SO_ERROR` 探测收尾。
 - N=0 边界：立即暂停、暂扣全部字节与 FIN，恢复后 8 字节测试载荷与回执完整。
 
 > 说明：发送器对回执读取带 `SENDER_RECEIPT_TIMEOUT`（默认 120s）超时保护，

@@ -106,19 +106,24 @@ async def _do_send(run_id: str, size: int, host: str, port: int) -> None:
         run["upload_sha256"] = digest.hexdigest()
         run["bytes_sent"] = size
         run["reverse_bytes"] = len(raw)
-        run["phase"] = "done"
         run["elapsed_seconds"] = round(elapsed, 6)
         try:
             receipt = json.loads(raw.decode().strip().splitlines()[-1])
         except (ValueError, UnicodeDecodeError, IndexError):
             receipt = None
         run["receipt"] = receipt
-        if receipt is not None:
-            run["hash_match"] = receipt.get("sha256") == digest.hexdigest()
-            run["byte_match"] = receipt.get("bytes") == size
-        else:
+        if receipt is None:
+            # EOF/truncation without a parsable receipt (e.g. the connection
+            # was force-closed during the receipt phase): this is not a
+            # successful run.
+            run["phase"] = "failed"
+            run["error"] = "connection ended without a complete receipt"
             run["hash_match"] = False
             run["byte_match"] = False
+            return
+        run["phase"] = "done"
+        run["hash_match"] = receipt.get("sha256") == digest.hexdigest()
+        run["byte_match"] = receipt.get("bytes") == size
     except (ConnectionError, asyncio.CancelledError, RuntimeError, OSError) as exc:
         run["phase"] = "failed"
         run["error"] = repr(exc)
